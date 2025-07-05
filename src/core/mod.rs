@@ -4,6 +4,33 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkAdapter {
+    pub name: String,
+    pub ip: IpAddr,
+    pub description: String,
+    pub is_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSettings {
+    pub selected_adapter: Option<String>, // adapter name
+    pub window_size: Option<(f32, f32)>,
+    pub auto_send_enabled: bool,
+    pub send_rate: u32,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            selected_adapter: None,
+            window_size: None,
+            auto_send_enabled: false,
+            send_rate: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SacnDevice {
     pub ip: IpAddr,
     pub universes: Vec<u16>,
@@ -57,6 +84,9 @@ pub struct AppState {
     pub selected_universe: Option<u16>,
     pub auto_send_enabled: bool,
     pub send_rate: u32, // packets per second
+    pub network_adapters: Vec<NetworkAdapter>,
+    pub selected_adapter: Option<String>,
+    pub settings: AppSettings,
 }
 
 impl AppState {
@@ -68,6 +98,9 @@ impl AppState {
             selected_universe: None,
             auto_send_enabled: false,
             send_rate: 20, // 20 Hz default
+            network_adapters: Vec::new(),
+            selected_adapter: None,
+            settings: AppSettings::default(),
         }
     }
 
@@ -120,5 +153,84 @@ impl AppState {
                 sequence,
             },
         );
+    }
+
+    pub fn load_settings(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(config_dir) =
+            directories::ProjectDirs::from("com", "sacn-viewer", "sACN Viewer")
+        {
+            let config_path = config_dir.config_dir().join("settings.json");
+            if config_path.exists() {
+                let contents = std::fs::read_to_string(&config_path)?;
+                let settings: AppSettings = serde_json::from_str(&contents)?;
+                self.settings = settings;
+                self.selected_adapter = self.settings.selected_adapter.clone();
+                self.auto_send_enabled = self.settings.auto_send_enabled;
+                self.send_rate = self.settings.send_rate;
+                self.add_log(LogLevel::Info, "Settings loaded successfully".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn save_settings(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(config_dir) =
+            directories::ProjectDirs::from("com", "sacn-viewer", "sACN Viewer")
+        {
+            std::fs::create_dir_all(config_dir.config_dir())?;
+            let config_path = config_dir.config_dir().join("settings.json");
+            let contents = serde_json::to_string_pretty(&self.settings)?;
+            std::fs::write(&config_path, contents)?;
+        }
+        Ok(())
+    }
+
+    pub fn update_adapter_selection(&mut self, adapter_name: Option<String>) {
+        self.selected_adapter = adapter_name.clone();
+        self.settings.selected_adapter = adapter_name;
+        if let Err(e) = self.save_settings() {
+            self.add_log(LogLevel::Warning, format!("Failed to save settings: {}", e));
+        }
+    }
+
+    pub fn refresh_network_adapters(&mut self) {
+        match if_addrs::get_if_addrs() {
+            Ok(interfaces) => {
+                self.network_adapters.clear();
+                for interface in interfaces {
+                    if !interface.is_loopback() {
+                        let adapter = NetworkAdapter {
+                            name: interface.name.clone(),
+                            ip: interface.ip(),
+                            description: format!("{} ({})", interface.name, interface.ip()),
+                            is_available: true,
+                        };
+                        self.network_adapters.push(adapter);
+                    }
+                }
+                self.add_log(
+                    LogLevel::Info,
+                    format!("Found {} network adapters", self.network_adapters.len()),
+                );
+            }
+            Err(e) => {
+                self.add_log(
+                    LogLevel::Error,
+                    format!("Failed to enumerate network adapters: {}", e),
+                );
+            }
+        }
+    }
+
+    pub fn get_selected_adapter_ip(&self) -> Option<IpAddr> {
+        if let Some(ref adapter_name) = self.selected_adapter {
+            self.network_adapters
+                .iter()
+                .find(|adapter| adapter.name == *adapter_name)
+                .map(|adapter| adapter.ip)
+        } else {
+            // Return first available adapter if none selected
+            self.network_adapters.first().map(|adapter| adapter.ip)
+        }
     }
 }

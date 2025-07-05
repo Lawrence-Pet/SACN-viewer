@@ -1,9 +1,9 @@
 use crate::core::{AppState, LogLevel};
 use anyhow::Result;
-use log::{debug, info};
-use sacn::packet::ACN_SDT_MULTICAST_PORT;
-use sacn::receive::{DMXData, SacnReceiver};
+use log::{debug, error, info, warn};
+use sacn::receive::SacnReceiver;
 use sacn::source::SacnSource;
+use sacn::packet::ACN_SDT_MULTICAST_PORT;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +16,9 @@ pub struct SacnNetwork {
 
 impl SacnNetwork {
     pub fn new(app_state: Arc<RwLock<AppState>>) -> Self {
-        Self { app_state }
+        Self { 
+            app_state,
+        }
     }
 
     pub async fn start_listener(&self) -> Result<()> {
@@ -31,13 +33,16 @@ impl SacnNetwork {
         };
 
         let addr = SocketAddr::new(bind_ip, ACN_SDT_MULTICAST_PORT);
-
+        
         // Create the sACN receiver with universe discovery enabled
         let mut receiver = match SacnReceiver::with_ip(addr, None) {
             Ok(receiver) => {
                 {
                     let mut state = self.app_state.write().await;
-                    state.add_log(LogLevel::Info, format!("sACN receiver created on {}", addr));
+                    state.add_log(
+                        LogLevel::Info,
+                        format!("sACN receiver created on {}", addr),
+                    );
                 }
                 receiver
             }
@@ -71,10 +76,7 @@ impl SacnNetwork {
             let mut state = self.app_state.write().await;
             state.add_log(
                 LogLevel::Info,
-                format!(
-                    "sACN listener started on {} port {}",
-                    bind_ip, ACN_SDT_MULTICAST_PORT
-                ),
+                format!("sACN listener started on {} port {}", bind_ip, ACN_SDT_MULTICAST_PORT),
             );
         }
 
@@ -82,10 +84,11 @@ impl SacnNetwork {
         loop {
             let timeout = Some(Duration::from_millis(100));
             match receiver.recv(timeout) {
-                Ok(packets) => {
-                    // Process received packets
-                    for packet in packets {
-                        self.handle_packet(packet).await;
+                Ok(data_packets) => {
+                    for packet in data_packets {
+                        if let Err(e) = self.handle_data_packet(packet).await {
+                            debug!("Error handling data packet: {}", e);
+                        }
                     }
                 }
                 Err(e) => {
@@ -96,10 +99,12 @@ impl SacnNetwork {
                                 LogLevel::Info,
                                 format!("Source discovered: {}", source_name),
                             );
-                            state.update_device(ip, universe, source_name, priority);
+                        }
+                        sacn::error::errors::ErrorKind::Timeout => {
+                            // Normal timeout, continue receiving
+                            continue;
                         }
                         _ => {
-                            // Handle other errors including timeouts
                             debug!("sACN receive error: {:?}", e);
                             sleep(Duration::from_millis(100)).await;
                         }
@@ -109,46 +114,52 @@ impl SacnNetwork {
         }
     }
 
-    async fn handle_packet(&self, packet: DMXData) {
-        let mut state = self.app_state.write().await;
+    async fn handle_data_packet(&self, packet: sacn::packet::DataPacket) -> Result<()> {
+        let universe = packet.universe();
+        let source_name = packet.source_name().to_string();
+        let priority = packet.priority();
+        let data = packet.data();
+        let sequence = packet.sequence_number();
 
-        // Log the received packet
-        state.add_log(
-            LogLevel::Rx,
-            format!(
-                "Received DMX data on universe {}: {} channels",
-                packet.universe,
-                packet.values.len()
-            ),
-        );
+        // Convert the source CID to an IP (we'll use a placeholder for now)
+        // In a real implementation, you might need to track source IPs separately
+        let source_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)); // Placeholder
 
-        // Convert Vec<u8> to [u8; 512], padding with zeros if needed
+        // Ensure we have 512 channels (skip start code if present)
         let mut channels = [0u8; 512];
-        let copy_len = std::cmp::min(packet.values.len(), 512);
-        if copy_len > 0 {
-            channels[..copy_len].copy_from_slice(&packet.values[..copy_len]);
-        }
+        let dmx_data = if data.len() > 0 && data[0] == 0 {
+            // Skip start code
+            &data[1..]
+        } else {
+            data
+        };
+        let data_len = std::cmp::min(dmx_data.len(), 512);
+        channels[..data_len].copy_from_slice(&dmx_data[..data_len]);
 
-        // Update universe data
-        state.update_universe(
-            packet.universe,
-            channels,
-            // We don't have direct access to source IP from DMXData,
-            // so we'll use a placeholder for now
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            0, // sequence not available in DMXData
-        );
-
-        // Update device information if we have source CID
-        if let Some(src_cid) = packet.src_cid {
-            let source_name = format!("Source-{}", src_cid);
+        {
+            let mut state = self.app_state.write().await;
+            
+            state.add_log(
+                LogLevel::Rx,
+                format!("Received sACN data from {} for universe {}", source_name, universe),
+            );
+            
             state.update_device(
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED), // placeholder
-                packet.universe,
+                source_ip,
+                universe,
                 source_name,
-                packet.priority,
+                priority,
+            );
+            
+            state.update_universe(
+                universe,
+                channels,
+                source_ip,
+                sequence,
             );
         }
+
+        Ok(())
     }
 
     pub async fn send_dmx(&self, universe: u16, dmx_data: &[u8; 512]) -> Result<()> {
@@ -160,9 +171,8 @@ impl SacnNetwork {
                 .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
         };
 
-        // Use a different port for sending to avoid conflicts
-        let bind_addr = SocketAddr::new(bind_ip, 0); // Let the OS choose a port
-
+        let bind_addr = SocketAddr::new(bind_ip, ACN_SDT_MULTICAST_PORT + 1);
+        
         // Create a new source for sending
         let mut source = match SacnSource::with_ip("sACN Viewer", bind_addr) {
             Ok(source) => source,
@@ -200,17 +210,16 @@ impl SacnNetwork {
                 let mut state = self.app_state.write().await;
                 state.add_log(
                     LogLevel::Tx,
-                    format!(
-                        "Sent DMX data to universe {}: {} channels",
-                        universe,
-                        dmx_data.len()
-                    ),
+                    format!("Sent DMX data to universe {}", universe),
                 );
                 Ok(())
             }
             Err(e) => {
                 let mut state = self.app_state.write().await;
-                state.add_log(LogLevel::Error, format!("Failed to send DMX data: {}", e));
+                state.add_log(
+                    LogLevel::Error,
+                    format!("Failed to send DMX data: {}", e),
+                );
                 Err(anyhow::anyhow!("Failed to send DMX data: {}", e))
             }
         }

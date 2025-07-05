@@ -18,6 +18,16 @@ async fn main() -> Result<()> {
     info!("Starting sACN Desktop Viewer");
 
     let app_state = Arc::new(RwLock::new(AppState::new()));
+
+    // Initialize network adapters and load settings
+    {
+        let mut state = app_state.write().await;
+        state.refresh_network_adapters();
+        if let Err(e) = state.load_settings() {
+            log::warn!("Failed to load settings: {}", e);
+        }
+    }
+
     let sacn_network = Arc::new(SacnNetwork::new(app_state.clone()));
 
     // Start the network listener in a background task

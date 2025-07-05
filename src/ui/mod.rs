@@ -34,6 +34,42 @@ impl eframe::App for MainWindow {
             ui.horizontal(|ui| {
                 ui.heading("sACN Desktop Viewer");
                 ui.separator();
+
+                // Network adapter selection
+                if let Ok(mut state) = self.app_state.try_write() {
+                    ui.label("Network Adapter:");
+                    let selected_text = state.selected_adapter.as_deref().unwrap_or("Auto");
+
+                    egui::ComboBox::from_id_source("adapter_combo")
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_value(&mut state.selected_adapter, None, "Auto")
+                                .clicked()
+                            {
+                                state.update_adapter_selection(None);
+                            }
+
+                            for adapter in &state.network_adapters.clone() {
+                                if ui
+                                    .selectable_value(
+                                        &mut state.selected_adapter,
+                                        Some(adapter.name.clone()),
+                                        &adapter.description,
+                                    )
+                                    .clicked()
+                                {
+                                    state.update_adapter_selection(Some(adapter.name.clone()));
+                                }
+                            }
+                        });
+
+                    if ui.button("Refresh").clicked() {
+                        state.refresh_network_adapters();
+                    }
+                }
+
+                ui.separator();
                 ui.label("Universe:");
                 ui.add(egui::DragValue::new(&mut self.send_universe).range(1..=63999));
                 ui.separator();
@@ -45,6 +81,39 @@ impl eframe::App for MainWindow {
         egui::SidePanel::left("left_panel")
             .default_width(300.0)
             .show(ctx, |ui| {
+                ui.heading("Network Status");
+
+                if let Ok(state) = self.app_state.try_read() {
+                    ui.group(|ui| {
+                        ui.label("Selected Adapter:");
+                        if let Some(ref adapter_name) = state.selected_adapter {
+                            if let Some(adapter) = state
+                                .network_adapters
+                                .iter()
+                                .find(|a| a.name == *adapter_name)
+                            {
+                                ui.label(format!("• {} ({})", adapter.name, adapter.ip));
+                            } else {
+                                ui.colored_label(egui::Color32::RED, "• Adapter not found");
+                            }
+                        } else {
+                            ui.label("• Auto-select");
+                        }
+
+                        ui.separator();
+                        ui.label("Available Adapters:");
+                        for adapter in &state.network_adapters {
+                            let color = if adapter.is_available {
+                                egui::Color32::GREEN
+                            } else {
+                                egui::Color32::RED
+                            };
+                            ui.colored_label(color, format!("• {}", adapter.description));
+                        }
+                    });
+                }
+
+                ui.separator();
                 ui.heading("Discovered Devices");
 
                 if let Ok(state) = self.app_state.try_read() {
